@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "MiniMax 模型",
-    "description": "在设置页填入 MiniMax 官方 API Key，即可在模型选择列表里使用 MiniMax-M3.1-Flash 与 MiniMax-M3，并查看 M Plan 套餐额度。"
+    "description": "在设置页填入 MiniMax 官方 API Key，即可在模型选择列表里使用 MiniMax-M3.1-Flash 与 MiniMax-M3，并查看 M Plan 套餐额度。支持保存多把 Key、给每把起备注名，并一键切换当前使用的那一把。"
   }
 }
