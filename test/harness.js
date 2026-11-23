@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 
 import { apply, CHANNEL } from "../lib/index.js";
 
-export function harness({ providers = {}, rpcHandleBroken = false, envKeys: initialEnv = {} } = {}) {
+export function harness({ providers = {}, rpcHandleBroken = false, envKeys: initialEnv = {}, config = {}, webSearchProvider = undefined } = {}) {
   const store = new Map();
   const envKeys = new Map(Object.entries(initialEnv));
   const state = { providers: structuredClone(providers), revision: 1, mutations: [] };
@@ -15,12 +15,41 @@ export function harness({ providers = {}, rpcHandleBroken = false, envKeys: init
   let rpcHandler;
   /** 通过 webServer 注册的路由（回退路径或 rpc.handle 的真实实现都会走这里）。 */
   const routes = [];
+  /** 本次宿主啟動時註冊的工具（名稱 + 定義 + 註冊選項）。 */
+  const registeredTools = [];
+  /** 本次宿主啟動時註冊的聯網搜尋 provider。 */
+  const searchProviders = [];
 
   const settings = {
+    /** 每次 mutate 的記錄（測試斷言用）。 */
+    writes: [],
     describe() {
-      return [{ ns: "include:llm-pi-ai", value: { providers: structuredClone(state.providers) }, revision: state.revision }];
+      return [
+        {
+          ns: "include:llm-pi-ai",
+          value: { providers: structuredClone(state.providers) },
+          revision: state.revision,
+        },
+        {
+          ns: "include:web",
+          value: { searchProvider: webSearchProvider },
+          revision: state.revision,
+        },
+      ];
     },
     async mutate(ns, ops, revision) {
+      if (ns === "include:web") {
+        // web.searchProvider 是 volatile 欄位：只影響 runtime，不寫進 patch。
+        assert.equal(revision, state.revision, "写入必须带上 describe 给出的 revision");
+        for (const op of ops) {
+          assert.equal(op.op, "set");
+          assert.deepEqual(op.path, ["searchProvider"]);
+          webSearchProvider = op.value;
+        }
+        settings.writes.push({ ns, ops: structuredClone(ops) });
+        state.revision += 1;
+        return;
+      }
       assert.equal(ns, "include:llm-pi-ai");
       assert.equal(revision, state.revision, "写入必须带上 describe 给出的 revision");
       for (const op of ops) {
@@ -87,7 +116,24 @@ export function harness({ providers = {}, rpcHandleBroken = false, envKeys: init
       },
     };
   }
-  const services = { settings, credentials, webServer };
+  const tools = {
+    /** 真實宿主是 ctx.tools.register(definition, options)；這裡只記錄下來供測試斷言。 */
+    register(definition, options) {
+      registeredTools.push({ definition, options });
+      return () => {};
+    },
+  };
+  /** 假的 web 服務：記錄註冊的搜尋 provider。 */
+  const web = {
+    registerSearchProvider(provider) {
+      searchProviders.push(provider);
+      return () => {};
+    },
+    registerFetchProvider() {
+      return () => {};
+    },
+  };
+  const services = { settings, credentials, webServer, tools, web };
   const emitted = [];
   const logs = [];
   const ctx = {
@@ -108,13 +154,32 @@ export function harness({ providers = {}, rpcHandleBroken = false, envKeys: init
       fn(scope);
     },
   };
-  apply(ctx, {});
+  // Plugin-level inject：`export const inject = [...]` 宣告的服務會**直接掛在插件的 ctx 上**，
+  // Loader 確保它們就緒後才呼叫 apply()。這與 runtime 的 ctx.inject() 是不同的機制 ——
+  // 測試替身必須反映真實行為，否則測試會通過而線上不рабо（搜尋 provider 註冊就是這樣壞掉的）。
+  ctx.tools = tools;
+  ctx.web = web;
+  ctx.settings = settings;
+  ctx.credentials = credentials;
+  apply(ctx, config);
   const call = (endpoint, payload) => {
     assert.ok(rpcHandler !== undefined || routes.length > 0, "RPC 频道没有注册上");
     if (rpcHandler !== undefined) return rpcHandler(endpoint, payload, new AbortController().signal, {});
     return viaFallback(routes[0], endpoint, payload);
   };
-  return { call, state, store, envKeys, emitted, logs, routes, connection: makeConnection({ webServer }) };
+  return {
+    call,
+    state,
+    store,
+    envKeys,
+    emitted,
+    logs,
+    routes,
+    registeredTools,
+    searchProviders,
+    settings,
+    connection: makeConnection({ webServer }),
+  };
 }
 
 /** 用一个假的 IncomingMessage / ServerResponse 驱动回退路由，返回解析后的 result。 */

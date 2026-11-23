@@ -1,6 +1,6 @@
 {
   "name": "dsh-llm-minimax",
-  "version": "0.2.0",
+  "version": "0.6.2",
   "private": true,
   "description": "MiniMax open-platform models for DeepSeek Harness: paste the API key in Settings → MiniMax, get MiniMax-M3.1-Flash / M3 in the model picker, and see M Plan quota windows. Keeps several API keys with your own remark names and switches which one is in use.",
   "keywords": ["dsh-plugin", "deepseek-harness", "minimax", "llm"],
@@ -33,7 +33,21 @@
   "scripts": {
     "test": "node --test test/"
   },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.2 <0.3.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
   "dsh": {
+    "engines": {
+      "dsh": ">=0.1.0-rc.2 <0.3.0-0"
+    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
