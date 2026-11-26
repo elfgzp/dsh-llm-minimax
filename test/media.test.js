@@ -14,7 +14,9 @@ import {
   SPEECH_MODELS,
   VIDEO_MODELS,
   createMediaTools,
+  createMiniMaxSearchProvider,
   sanitizeFileName,
+  withoutUndefined,
 } from "../lib/media.js";
 
 /** 建一組假的依賴，不做任何真實呼叫。 */
@@ -25,6 +27,67 @@ function fakeTools() {
     log: () => {},
   });
 }
+
+/**
+ * 建一組會攔截 fetch 的依賴，讓測試能驗證「工具實際輸出的形狀」而不打網路。
+ *
+ * @param {object} response - 假的 Anthropic 回應內容。
+ * @returns {{ tools: object[], calls: object[] }} 工具組與已攔截的請求。
+ */
+function fakeToolsWithFetch(response) {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify(response);
+      },
+    };
+  };
+  const tools = createMediaTools({
+    resolveActiveKey: async () => ({
+      region: "cn",
+      key: "sk-test",
+      apiRoot: "https://api.test",
+      anthropicBase: "https://api.test/anthropic",
+    }),
+    resolveWorkingDirectory: async () => process.cwd(),
+    log: () => {},
+  });
+  return {
+    tools,
+    calls,
+    restore() {
+      globalThis.fetch = originalFetch;
+    },
+  };
+}
+
+/** 一個帶著各種缺失欄位的搜尋回應（title / page_age 都可能沒有）。 */
+const SEARCH_RESPONSE = {
+  content: [
+    { type: "text", text: "搜尋到的答案。" },
+    {
+      type: "server_tool_use",
+      id: "call_1",
+      name: "web_search",
+      input: { query: "測試查詢" },
+    },
+    {
+      type: "web_search_tool_result",
+      tool_use_id: "call_1",
+      content: [
+        // 沒有 title、沒有 page_age 的來源 —— 正是造成 undefined 的那種情況
+        { type: "web_search_result", url: "https://example.com/a", content: "片段 A" },
+        { type: "web_search_result", url: "https://example.com/b", title: "有標題", content: "片段 B", page_age: "2026/11/26" },
+      ],
+    },
+  ],
+  stop_reason: "end_turn",
+};
 
 test("sanitizeFileName 去掉路徑成分與 Windows 非法字元", () => {
   assert.equal(sanitizeFileName("a/b/c.txt", "fallback"), "c.txt");
@@ -42,6 +105,89 @@ test("sanitizeFileName 避開 Windows 保留裝置名", () => {
 test("sanitizeFileName 去掉尾端空白與句點", () => {
   assert.equal(sanitizeFileName("name...", "fallback"), "name");
   assert.equal(sanitizeFileName("name. .", "fallback"), "name");
+});
+
+test("回歸：搜尋輸出不能含 undefined（否則 DSH 拒收整個結果）", () => {
+  // 這條守的是一個真的壞過的 bug：搜尋結果的來源物件用 `title: undefined` 這類寫法
+  // 表示「沒有這個欄位」，而 undefined 不是合法 JSON 值 —— DSH 直接拒收整個工具輸出，
+  // 回報 "value is not lossless JSON"，工具等於完全不能用。
+  const source = {
+    url: "https://example.com/a",
+    title: undefined,
+    snippet: "內容",
+    publishedAt: undefined,
+  };
+  const cleaned = withoutUndefined(source);
+  assert.deepEqual(Object.keys(cleaned).sort(), ["snippet", "url"]);
+  // JSON 序列化後必須與原物件完全一致（無損）。
+  assert.equal(JSON.stringify(cleaned), JSON.stringify({ url: "https://example.com/a", snippet: "內容" }));
+  // 而且序列化/反序列化不能改變內容。
+  assert.deepEqual(JSON.parse(JSON.stringify(cleaned)), cleaned);
+});
+
+test("回歸：原生 web_search provider 的來源也要清掉 undefined", () => {
+  const provider = harness().searchProviders[0];
+  assert.equal(provider.id, "minimax");
+  // provider 的 search() 內部組出 sources 時同樣會帶 undefined 欄位；
+  // 這裡確認清理函式對「整個來源缺欄位」的情況也成立。
+  const noTitle = withoutUndefined({ url: "https://example.com/b", title: undefined });
+  assert.equal("title" in noTitle, false);
+});
+
+test("回歸：minimax_search 的實際輸出是 lossless JSON", async () => {
+  const { tools, restore } = fakeToolsWithFetch(SEARCH_RESPONSE);
+  try {
+    const search = tools.find((t) => t.name === "minimax_search");
+    const result = await search.execute({ query: "測試查詢", maxUses: 2 }, { signal: undefined });
+
+    // 遞迴檢查有沒有任何 undefined 值 —— 這是 DSH 拒收的真正條件。
+    const findUndefined = (value, path = "$") => {
+      if (value === undefined) return [path];
+      if (value === null || typeof value !== "object") return [];
+      const out = [];
+      for (const [key, child] of Object.entries(value)) {
+        if (child === undefined) out.push(`${path}.${key}`);
+        else out.push(...findUndefined(child, `${path}.${key}`));
+      }
+      return out;
+    };
+    assert.deepEqual(findUndefined(result), [], "輸出不得含 undefined 值");
+    // JSON round-trip 必須無損。
+    assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
+    // 內容也確認正確。
+    assert.equal(result.answer, "搜尋到的答案。");
+    assert.deepEqual(result.searches, ["測試查詢"]);
+    assert.equal(result.sources.length, 2);
+    assert.equal(result.sources[0].url, "https://example.com/a");
+    assert.equal("title" in result.sources[0], false, "沒有 title 時不應出現該欄位");
+    assert.equal(result.sources[1].title, "有標題");
+    assert.equal(result.sources[1].publishedAt, "2026/11/26");
+  } finally {
+    restore();
+  }
+});
+
+test("回歸：原生 web_search provider 的輸出也是 lossless JSON", async () => {
+  const { tools, restore } = fakeToolsWithFetch(SEARCH_RESPONSE);
+  try {
+    const provider = createMiniMaxSearchProvider({
+      resolveActiveKey: async () => ({
+        region: "cn",
+        key: "sk-test",
+        apiRoot: "https://api.test",
+        anthropicBase: "https://api.test/anthropic",
+      }),
+    });
+    const result = await provider.search({ query: "測試查詢" });
+    const json = JSON.stringify(result);
+    assert.equal(json.includes("undefined"), false, "序列化後不得出現 undefined");
+    assert.deepEqual(JSON.parse(json), result);
+    assert.equal(result.sources.length, 2);
+    assert.equal("title" in result.sources[0], false);
+    assert.ok(tools.length > 0);
+  } finally {
+    restore();
+  }
 });
 
 test("工具集提供六個工具，名稱符合預期", () => {
