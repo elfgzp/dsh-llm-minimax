@@ -6,6 +6,8 @@
 
 需要 DeepSeek Harness 0.2.x。
 
+> **升级插件后需要重启 DSH**。主机不会热重载宿主插件的代码：不重启的话，新版本里的
+> 工具与 provider 不会生效。
 **在 Web 界面里装**：侧边栏 → **插件** → **添加插件** → **安装第三方插件**，粘贴仓库地址：
 
 ```
@@ -113,6 +115,111 @@ DSH 自带的 `@deepseek-ai/dsh-llm-pi-ai` 已经有 `minimax-cn` 和 `minimax` 
 | MiniMax-M3 | 1,000,000 | 131,072（上限 524,288） | 自适应；可选关闭或 low … max |
 
 M2.5 / M2.7 系列于 2026-11-18 退役。M Plan 下旧名字会自动路由到 M3.1 Flash，按量付费请求退役后会失败。
+
+## 多模态工具
+
+除了聊天模型，本插件还注册了六个 **MiniMax 专用的模型工具**，让 agent 用同一把 Key 直接调用
+MiniMax 的多模态与联网能力。它们在「有生效的 Key」时才出现在模型面前；没有 Key 就不该让模型
+反复调用然后拿到一句「尚未设置 API Key」。
+
+| 工具 | 能力 | 官方端点 |
+|---|---|---|
+| `minimax_search` | 联网搜索：模型在 MiniMax 服务端自己检索并作答，回传整理好的答案与来源网址 | `POST /anthropic/v1/messages`（服务端工具 `web_search_20250305`） |
+| `minimax_generate_image` | 文生图 / 图生图（1–16 张参考图），落地成图片文件 | `POST /v1/images/generations`、`POST /v1/images/edits` |
+| `minimax_generate_video` | 视频生成，支持首帧 / 尾帧，内部轮询到终态 | `POST /v2/video_generation` |
+| `minimax_video_status` | 查视频任务状态；已完成时直接下载 mp4 | `GET /v2/query/video_generation/{task_id}` |
+| `minimax_speak` | 语音合成，落地成 mp3（单次 1 万字） | `POST /v1/t2a_v2` |
+| `minimax_speak_long` | 长文本语音合成（单次 10 万字 / 总量 100 万字），异步建任务并抓回音档 | `POST /v1/t2a_async_v2` + `GET /v1/query/t2a_async_query_v2` |
+| `minimax_speak_status` | 查异步语音任务；已完成时把音档抓回本地 | `GET /v1/query/t2a_async_query_v2` |
+| `minimax_transcribe` | 语音识别（asr-1.0），可输出逐字稿、说话人分段、srt/vtt 字幕 | `POST /v1/speech_to_text` |
+| `minimax_voices` | 列出可用音色（系统 / 复刻 / 文生） | `POST /v1/get_voice` |
+| `minimax_clone_voice` | 用自己的音频复刻出一个音色 | `POST /v1/files/upload` + `POST /v1/voice_clone` |
+| `minimax_design_voice` | 用文字描述设计一个新音色 | `POST /v1/voice_design` |
+| `minimax_upload_file` | 上传文件换取 `mm_file://{file_id}` 引用（保存 7 天） | `POST /v1/files/upload` |
+| `minimax_video_tasks` | 列出最近 7 天的视频生成任务，可按状态/模型/类型筛选 | `GET /v2/query/video_generation` |
+| `minimax_video_cancel` | 取消排队中的任务（不扣费）或删除已结束的记录 | `DELETE /v2/video_generation/{task_id}` |
+
+支持的模型：
+
+- 图像：`MiniMax-H3-Image`、`MiniMax-H3-Image-Highspeed`
+- 视频：`MiniMax-H3`（支持 768P / 2K）、`MiniMax-H3-Highspeed`、`MiniMax-H3-Lite`、`MiniMax-H3-Max`
+- 语音：`speech-2.8-hd`、`speech-2.8-turbo`、`speech-2.6-hd`、`speech-2.6-turbo`、`speech-02-hd`、`speech-02-turbo`
+- 识别：`asr-1.0`
+
+产物落在**调用它的那个会话的工作目录**里，工具返回绝对路径。
+
+### 音色复刻与设计的前置条件
+
+- `minimax_clone_voice` **要求账号已完成个人或企业认证**，否则返回 `voice clone user forbidden`。
+- 复刻出的音色是**临时音色**：7 天内没有被正式用于语音合成就会被删除。
+- `minimax_design_voice` 在部分订阅档位下不可用（会返回「token plan not support model, preview_text」）。
+
+### 两代端点的错误形状不同
+
+- 语音、文件这批**旧世代**端点固定返回 HTTP 200，失败写在 `base_resp.status_code`
+  （1004 鉴权失败、1002 限流、2013 参数错、1008 余额不足）。
+- 语音识别与视频 V2 这批**新世代**端点用真实 HTTP 状态码，body 是 OpenAI 风格的 `error`。
+
+插件两种都认，并把错误码翻译成人能读的句子。
+
+### 为什么联网搜索要自己实现
+
+底层的 `pi-ai` 在 Anthropic 协议下只会生成 **client tool**（`{name, description, input_schema}`），
+无法透传 MiniMax 的**服务端工具**。所以 `minimax_search` 直接打 Anthropic 兼容端点，把
+`server_tool_use` 与 `web_search_tool_result` 两种内容块收敛成「答案 + 来源列表」。
+
+这条路径**不依赖 DeepSeek 账号余额**——DSH 内置的 `web_search` 走的是 DeepSeek 的
+`/v1/tools/search`，余额不足时会直接失败。
+
+### 接管原生 web_search
+
+本插件还把 MiniMax 注册成 DSH 的联网搜索 provider，并把 `web.searchProvider` 指向它，
+**原生 `web_search` 工具因此改走 MiniMax**，不再需要 DeepSeek 余额。
+
+规则：
+
+- 只有在你**没有自己指定过** `web.searchProvider` 时才接管；明确的设置永远优先。
+- `web.searchProvider` 是 volatile 字段，只在运行时生效，不写进 profile patch，
+  所以每次启动由本插件重新设定。
+- 不想接管就把插件配置 `disableWebSearchTakeover` 设成 `true`（默认 `false`，即接管）。
+
+接管状态会写到 `~/.dsh/minimax-native-search.json`（Windows 下是
+`C:\Users\<你>\.dsh\minimax-native-search.json`），里面会写明当前主���跑的是哪个版本、
+provider 有没有注册成功、以及接管走到了哪一步：
+
+```json
+{
+  "takeover": true,
+  "provider": "minimax",
+  "takeoverEnabled": true,
+  "providerRegistered": true,
+  "pluginVersion": "0.6.2",
+  "rawConfig": {},
+  "checkedAt": "2026-11-23T07:30:00.000Z"
+}
+```
+
+> 这个文件用 `~/.dsh` 兜底，而不是只依赖 `$DSH_HOME` 环境变量 —— 主机进程不一定带这个
+> 变量，只靠它会把采样与状态写到不存在的路径，而且因为写入被静默吞掉，看起来一切正常，
+> 实际上每分钟的用量采样从来没落地过。
+
+### 两条硬约束
+
+1. **图像接口不支持幂等**：请求发出后，即使客户端超时或断开，服务端仍会完成生成并对成功的图片
+   计数费，重试会重新生成并重复计费。因此本插件**不做自动重试**，超时就是超时，如实回报。
+2. **图像接口服务端最长等待 600 秒**，客户端超时必须不低于 600 秒，否则会出现「已计费但没拿到
+   图片」。插件设 660 秒。
+
+### 音乐
+
+MiniMax 的音乐生成（`music-3.0` 等）自 2026-08-20 起不再面向新用户提供服务，本插件不提供该工具。
+
+### 没有做进去的 Matrix 专属能力
+
+MiniMax Code 桌面客户端还有一个 Matrix 网关（`agent.minimax.cn`），额外提供**去背**、
+**图片增强**、**图片搜索**与**反向搜图**。这些能力走的是客户端的登录态（Matrix OAuth token），
+不是开放平台的 API Key；本机那份 token 早已过期，且 `~/.minimax/mcp/mcp.json` 指向的
+`matrix-mcp-cli` 并不存在。因此本插件**不包含**这四项，避免依赖一个跑不起来的通路。
 
 ## 测试
 
